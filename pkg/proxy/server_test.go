@@ -16,6 +16,7 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"fmt"
 	"io/ioutil"
@@ -29,7 +30,7 @@ import (
 	"testing"
 	"time"
 
-	"go.etcd.io/etcd/pkg/v3/transport"
+	"go.etcd.io/etcd/client/pkg/v3/transport"
 
 	"go.uber.org/zap"
 )
@@ -615,7 +616,7 @@ func send(t *testing.T, data []byte, scheme, addr string, tlsInfo transport.TLSI
 		if terr != nil {
 			t.Fatal(terr)
 		}
-		out, err = tp.Dial(scheme, addr)
+		out, err = tp.DialContext(context.Background(), scheme, addr)
 	} else {
 		out, err = net.Dial(scheme, addr)
 	}

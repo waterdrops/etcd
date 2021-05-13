@@ -33,13 +33,14 @@ import (
 	"time"
 
 	pb "go.etcd.io/etcd/api/v3/etcdserverpb"
+	"go.etcd.io/etcd/client/pkg/v3/testutil"
+	"go.etcd.io/etcd/client/pkg/v3/tlsutil"
+	"go.etcd.io/etcd/client/pkg/v3/transport"
+	"go.etcd.io/etcd/client/pkg/v3/types"
 	"go.etcd.io/etcd/client/v2"
 	"go.etcd.io/etcd/client/v3"
-	"go.etcd.io/etcd/pkg/v3/testutil"
-	"go.etcd.io/etcd/pkg/v3/tlsutil"
-	"go.etcd.io/etcd/pkg/v3/transport"
-	"go.etcd.io/etcd/pkg/v3/types"
 	"go.etcd.io/etcd/raft/v3"
+	"go.etcd.io/etcd/server/v3/config"
 	"go.etcd.io/etcd/server/v3/embed"
 	"go.etcd.io/etcd/server/v3/etcdserver"
 	"go.etcd.io/etcd/server/v3/etcdserver/api/etcdhttp"
@@ -51,6 +52,7 @@ import (
 	"go.etcd.io/etcd/server/v3/etcdserver/api/v3lock"
 	lockpb "go.etcd.io/etcd/server/v3/etcdserver/api/v3lock/v3lockpb"
 	"go.etcd.io/etcd/server/v3/etcdserver/api/v3rpc"
+	"go.etcd.io/etcd/server/v3/verify"
 	"go.uber.org/zap/zapcore"
 	"go.uber.org/zap/zaptest"
 
@@ -58,7 +60,6 @@ import (
 	"go.uber.org/zap"
 	"golang.org/x/crypto/bcrypt"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/grpclog"
 	"google.golang.org/grpc/keepalive"
 )
 
@@ -167,7 +168,7 @@ type cluster struct {
 
 func (c *cluster) generateMemberName() string {
 	c.lastMemberNum++
-	return fmt.Sprintf("m%v", c.lastMemberNum)
+	return fmt.Sprintf("m%v", c.lastMemberNum-1)
 }
 
 func schemeFromTLSInfo(tls *transport.TLSInfo) string {
@@ -247,6 +248,9 @@ func (c *cluster) Launch(t testutil.TB) {
 	// wait cluster to be stable to receive future client requests
 	c.waitMembersMatch(t, c.HTTPMembers())
 	c.waitVersion()
+	for _, m := range c.Members {
+		t.Logf(" - %v -> %v (%v)", m.Name, m.ID(), m.GRPCAddr())
+	}
 }
 
 func (c *cluster) URL(i int) string {
@@ -525,10 +529,6 @@ func (c *cluster) waitVersion() {
 	}
 }
 
-func (c *cluster) name(i int) string {
-	return fmt.Sprint(i)
-}
-
 // isMembersEqual checks whether two members equal except ID field.
 // The given wmembs should always set ID field to empty string.
 func isMembersEqual(membs []client.Member, wmembs []client.Member) bool {
@@ -556,7 +556,7 @@ func NewListenerWithAddr(t testutil.TB, addr string) net.Listener {
 }
 
 type member struct {
-	etcdserver.ServerConfig
+	config.ServerConfig
 	PeerListeners, ClientListeners []net.Listener
 	grpcListener                   net.Listener
 	// PeerTLSInfo enables peer TLS when set
@@ -584,6 +584,7 @@ type member struct {
 	useIP                    bool
 
 	isLearner bool
+	closed    bool
 }
 
 func (m *member) GRPCAddr() string { return m.grpcAddr }
@@ -705,13 +706,9 @@ func mustNewMember(t testutil.TB, mcfg memberConfig) *member {
 	m.InitialCorruptCheck = true
 	m.WarningApplyDuration = embed.DefaultWarningApplyDuration
 
-	level := zapcore.InfoLevel
-	if os.Getenv("CLUSTER_DEBUG") != "" {
-		level = zapcore.DebugLevel
-	}
+	m.V2Deprecation = config.V2_DEPR_DEFAULT
 
-	options := zaptest.WrapOptions(zap.Fields(zap.String("member", mcfg.name)))
-	m.Logger = zaptest.NewLogger(t, zaptest.Level(level), options)
+	m.Logger = memberLogger(t, mcfg.name)
 	t.Cleanup(func() {
 		// if we didn't cleanup the logger, the consecutive test
 		// might reuse this (t).
@@ -720,10 +717,21 @@ func mustNewMember(t testutil.TB, mcfg memberConfig) *member {
 	return m
 }
 
+func memberLogger(t testutil.TB, name string) *zap.Logger {
+	level := zapcore.InfoLevel
+	if os.Getenv("CLUSTER_DEBUG") != "" {
+		level = zapcore.DebugLevel
+	}
+
+	options := zaptest.WrapOptions(zap.Fields(zap.String("member", name)))
+	return zaptest.NewLogger(t, zaptest.Level(level), options).Named(name)
+}
+
 // listenGRPC starts a grpc server over a unix domain socket on the member
 func (m *member) listenGRPC() error {
 	// prefix with localhost so cert has right domain
 	m.grpcAddr = "localhost:" + m.Name
+	m.Logger.Info("LISTEN GRPC", zap.String("m.grpcAddr", m.grpcAddr), zap.String("m.Name", m.Name))
 	if m.useIP { // for IP-only TLS certs
 		m.grpcAddr = "127.0.0.1:" + m.Name
 	}
@@ -777,12 +785,12 @@ func NewClientV3(m *member) (*clientv3.Client, error) {
 	if m.DialOptions != nil {
 		cfg.DialOptions = append(cfg.DialOptions, m.DialOptions...)
 	}
-	return newClientV3(cfg)
+	return newClientV3(cfg, m.Logger.Named("client"))
 }
 
 // Clone returns a member with the same server configuration. The returned
 // member will not set PeerListeners and ClientListeners.
-func (m *member) Clone(_ testutil.TB) *member {
+func (m *member) Clone(t testutil.TB) *member {
 	mm := &member{}
 	mm.ServerConfig = m.ServerConfig
 
@@ -809,6 +817,7 @@ func (m *member) Clone(_ testutil.TB) *member {
 	mm.ElectionTicks = m.ElectionTicks
 	mm.PeerTLSInfo = m.PeerTLSInfo
 	mm.ClientTLSInfo = m.ClientTLSInfo
+	mm.Logger = memberLogger(t, mm.Name+"c")
 	return mm
 }
 
@@ -1071,6 +1080,16 @@ func (m *member) Close() {
 	for _, f := range m.serverClosers {
 		f()
 	}
+	if !m.closed {
+		// Avoid verification of the same file multiple times
+		// (that might not exist any longer)
+		verify.MustVerifyIfEnabled(verify.Config{
+			Logger:     m.Logger,
+			DataDir:    m.DataDir,
+			ExactIndex: false,
+		})
+	}
+	m.closed = true
 }
 
 // Stop stops the member, but the data dir of the member is preserved.
@@ -1271,10 +1290,17 @@ func NewClusterV3(t testutil.TB, cfg *ClusterConfig) *ClusterV3 {
 	t.Helper()
 	testutil.SkipTestIfShortMode(t, "Cannot create clusters in --short tests")
 
-	cfg.UseGRPC = true
-	if os.Getenv("CLIENT_DEBUG") != "" {
-		clientv3.SetLogger(grpclog.NewLoggerV2WithVerbosity(os.Stderr, os.Stderr, os.Stderr, 4))
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
 	}
+	if !strings.HasPrefix(wd, os.TempDir()) {
+		t.Errorf("Working directory '%s' expected to be in temp-dir ('%s')."+
+			"Have you executed integration.BeforeTest(t) ?", wd, os.TempDir())
+	}
+
+	cfg.UseGRPC = true
+
 	clus := &ClusterV3{
 		cluster: NewClusterByConfig(t, cfg),
 	}

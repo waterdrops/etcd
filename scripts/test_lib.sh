@@ -164,7 +164,7 @@ function run_for_module {
 }
 
 function module_dirs() {
-  echo "api pkg raft client/v2 client/v3 server etcdctl tests ."
+  echo "api pkg raft client/pkg client/v2 client/v3 server etcdctl tests ."
 }
 
 # maybe_run [cmd...] runs given command depending on the DRY_RUN flag.
@@ -181,6 +181,7 @@ function modules() {
     "${ROOT_MODULE}/api/v3"
     "${ROOT_MODULE}/pkg/v3"
     "${ROOT_MODULE}/raft/v3"
+    "${ROOT_MODULE}/client/pkg/v3"
     "${ROOT_MODULE}/client/v2"
     "${ROOT_MODULE}/client/v3"
     "${ROOT_MODULE}/server/v3"
@@ -242,10 +243,6 @@ function go_test {
   if [ "${VERBOSE}" == "1" ]; then
     goTestFlags="-v"
   fi
-  if [ "${VERBOSE}" == "2" ]; then
-    goTestFlags="-v"
-    goTestEnv="CLIENT_DEBUG=1"
-  fi
 
   # Expanding patterns (like ./...) into list of packages
 
@@ -270,6 +267,7 @@ function go_test {
     # shellcheck disable=SC2206
     local cmd=( go test ${goTestFlags} ${additional_flags} "$@" ${pkg} )
 
+    # shellcheck disable=SC2086
     if ! run env ${goTestEnv} "${cmd[@]}" ; then
       if [ "${mode}" != "keep_going" ]; then
         return 2

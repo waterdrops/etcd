@@ -23,7 +23,7 @@ import (
 	"time"
 
 	pb "go.etcd.io/etcd/api/v3/etcdserverpb"
-	"go.etcd.io/etcd/pkg/v3/transport"
+	"go.etcd.io/etcd/client/pkg/v3/transport"
 	"go.etcd.io/etcd/server/v3/etcdserver"
 )
 
@@ -45,10 +45,6 @@ func TestMetricDbSizeBoot(t *testing.T) {
 
 func TestMetricDbSizeDefrag(t *testing.T) {
 	testMetricDbSizeDefrag(t, "etcd")
-}
-
-func TestMetricDbSizeDefragDebugging(t *testing.T) {
-	testMetricDbSizeDefrag(t, "etcd_debugging")
 }
 
 // testMetricDbSizeDefrag checks that the db size metric is set after defrag.
